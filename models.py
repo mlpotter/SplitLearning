@@ -1,22 +1,36 @@
 import torch.nn as nn
 import torch.nn.functional as F
+import torch
 
-# split up the model from the pytorch classification tutorial on cifar10 https://pytorch.org/tutorials/beginner/blitz/cifar10_tutorial.html
+class model1(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1,32, 3)
+        self.pool = nn.MaxPool2d(2, 2)
 
-# convolution portion
-model1 = nn.Sequential(nn.Conv2d(3,6,5),
-                       nn.ReLU(),
-                       nn.MaxPool2d(2,2),
-                       nn.Conv2d(6,16,5),
-                       nn.MaxPool2d(2,2),
-                       nn.ReLU()
-                       )
+    def forward(self, x):
+        # x = x.view(-1,1,28,28)
+        x = self.pool(F.relu(self.conv1(x)))
+        return x
 
-# reduction portion
-model2 = nn.Sequential(nn.Linear(16*5*5,120),
-                       nn.ReLU(),
-                       nn.Linear(120,84),
-                       nn.ReLU())
+class model2(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(32*13*13,1000)
+        self.fc2 = nn.Linear(1000,100)
 
-# classification portion
-model3 = nn.Sequential(nn.Linear(84,10))
+    def forward(self, x):
+        x = torch.flatten(x, 1) # flatten all dimensions except batch
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+
+        return x
+
+class model3(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc3 = nn.Linear(100, 10)
+
+    def forward(self, x):
+        x = self.fc3(x)
+        return x

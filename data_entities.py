@@ -3,7 +3,7 @@ import logging
 import torch.distributed.rpc
 import torch
 import torch.nn as nn
-from models import model1,model2,model3
+from models import *
 import torchvision
 import torchvision.transforms as transforms
 from torch.distributed.rpc import RRef
@@ -11,112 +11,102 @@ import torch.distributed.rpc as rpc
 import torch.distributed.autograd as dist_autograd
 from torch.distributed.optim import DistributedOptimizer
 import logging
+import os
+from collections import Counter
+from copy import deepcopy
 
 class alice(object):
-    def __init__(self,server,bob_model_rrefs):
+    def __init__(self,server,bob_model_rrefs,rank,args):
+        self.client_id = rank
+        self.epochs = args.epochs
+        self.start_logger()
+
         self.bob = server
 
-        self.model1 = model1
-        self.model2 = model3
-
+        self.model1 = model1()
+        self.model2 = model3()
 
         self.criterion = nn.CrossEntropyLoss()
 
         self.dist_optimizer=  DistributedOptimizer(
                     torch.optim.SGD,
                     list(map(lambda x: RRef(x),self.model2.parameters())) +  bob_model_rrefs +  list(map(lambda x: RRef(x),self.model1.parameters())),
-                    lr=0.001,
+                    lr=args.lr,
                     momentum = 0.9
                 )
 
-        self.load_data()
-
-        self.start_logger()
+        self.load_data(args)
 
 
-    def train(self):
+    def train(self,last_alice_rref,last_alice_id):
         self.logger.info("Training")
 
-        running_loss = 0.0
-        for i,data in enumerate(self.train_dataloader):
-            inputs,labels = data
+        if last_alice_rref is None:
+            self.logger.info(f"Alice{self.client_id} is first client to train")
 
-            with dist_autograd.context() as context_id:
+        else:
+            self.logger.info(f"Alice{self.client_id} receiving weights from Alice{last_alice_id}")
+            model1_weights,model2_weights = last_alice_rref.rpc_sync().give_weights()
+            self.model1.load_state_dict(model1_weights)
+            self.model2.load_state_dict(model2_weights)
 
-                activation_alice1 = self.model1(inputs)
-                activation_alice1 = torch.flatten(activation_alice1, 1)
-                activation_bob = self.bob.rpc_sync().train(activation_alice1) #model(activation_alice1)
-                activation_alice2 = self.model2(activation_bob)
 
-                loss = self.criterion(activation_alice2,labels)
+        for epoch in range(self.epochs):
+            for i,data in enumerate(self.train_dataloader):
+                inputs,labels = data
 
-                # run the backward pass
-                dist_autograd.backward(context_id, [loss])
+                with dist_autograd.context() as context_id:
 
-                self.dist_optimizer.step(context_id)
+                    activation_alice1 = self.model1(inputs)
+                    activation_bob = self.bob.rpc_sync().train(activation_alice1) #model(activation_alice1)
+                    activation_alice2 = self.model2(activation_bob)
 
-            # print statistics
-            running_loss += loss.item()
-            if i % 2000 == 1999:  # print every 2000 mini-batches
-                print(f'[x, {i + 1:5d}] loss: {running_loss / 2000:.3f}')
-                running_loss = 0.0
+                    loss = self.criterion(activation_alice2,labels)
+
+                    # run the backward pass
+                    dist_autograd.backward(context_id, [loss])
+
+                    self.dist_optimizer.step(context_id)
+
+
+    def give_weights(self):
+        return [deepcopy(self.model1.state_dict()), deepcopy(self.model2.state_dict())]
 
     def eval(self):
-        self.logger.info("Evaluation")
-
-        # prepare to count predictions for each class
-        correct_pred = {classname: 0 for classname in self.classes}
-        total_pred = {classname: 0 for classname in self.classes}
-
-        # again no gradients needed
+        correct = 0
+        total = 0
+        # since we're not training, we don't need to calculate the gradients for our outputs
         with torch.no_grad():
             for data in self.test_dataloader:
                 images, labels = data
+                # calculate outputs by running images through the network
+                activation_alice1 = self.model1(images)
+                activation_bob = self.bob.rpc_sync().train(activation_alice1)  # model(activation_alice1)
+                outputs = self.model2(activation_bob)
+                # the class with the highest energy is what we choose as prediction
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
 
-                x = self.model1(images)
-                x = torch.flatten(x, 1)
-                x = self.bob.rpc_sync().train(x)  # model(activation_alice1)
-                outputs = self.model2(x)
+        self.logger.info(f"Alice{self.client_id} Evaluating Data: {round(correct / total, 3)}")
+        return correct, total
 
-                _, predictions = torch.max(outputs, 1)
-                # collect the correct predictions for each class
-                for label, prediction in zip(labels, predictions):
-                    if label == prediction:
-                        correct_pred[self.classes[label]] += 1
-                    total_pred[self.classes[label]] += 1
+    def load_data(self,args):
+        self.train_dataloader = torch.load(os.path.join(args.datapath ,f"data_worker{self.client_id}_train.pt"))
+        self.test_dataloader = torch.load(os.path.join(args.datapath ,f"data_worker{self.client_id}_test.pt"))
 
-        # print accuracy for each class
-        for classname, correct_count in correct_pred.items():
-            accuracy = 100 * float(correct_count) / total_pred[classname]
-            self.logger.info(f'Accuracy for class: {classname:5s} is {accuracy:.1f} %')
-
-    def load_data(self):
-        transform = transforms.Compose(
-            [transforms.ToTensor(),
-             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-
-        batch_size = 4
-
-        trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
-                                                download=True, transform=transform)
-        self.train_dataloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size,
-                                                  shuffle=True, num_workers=2)
-
-        testset = torchvision.datasets.CIFAR10(root='./data', train=False,
-                                               download=True, transform=transform)
-        self.test_dataloader = torch.utils.data.DataLoader(testset, batch_size=batch_size,
-                                                 shuffle=False, num_workers=2)
-
-        self.classes = ('plane', 'car', 'bird', 'cat',
-                   'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
+        self.n_train = len(self.train_dataloader.dataset)
+        self.logger.info("Local Data Statistics:")
+        self.logger.info("Dataset Size: {:.2f}".format(self.n_train))
+        self.logger.info(dict(Counter(self.test_dataloader.dataset[:][1].numpy().tolist())))
 
     def start_logger(self):
-        self.logger = logging.getLogger("alice")
+        self.logger = logging.getLogger(f"alice{self.client_id}")
         self.logger.setLevel(logging.INFO)
 
         format = logging.Formatter("%(asctime)s: %(message)s")
 
-        fh = logging.FileHandler(filename="logs/alice.log",mode='w')
+        fh = logging.FileHandler(filename=f"logs/alice{self.client_id}.log",mode='w')
         fh.setFormatter(format)
         fh.setLevel(logging.INFO)
 
@@ -127,23 +117,38 @@ class alice(object):
 
 
 class bob(object):
-    def __init__(self):
+    def __init__(self,args):
 
         self.server = RRef(self)
-        self.model = model2
+        self.model = model2()
         model_rrefs = list(map(lambda x: RRef(x),self.model.parameters()))
 
-        self.alice = rpc.remote("alice", alice, (self.server,model_rrefs))
-
+        self.alices = {rank+1: rpc.remote(f"alice{rank+1}", alice, (self.server,model_rrefs,rank+1,args)) for rank in range(args.client_num_in_total)}
+        self.last_alice_id = None
+        self.client_num_in_total  = args.client_num_in_total
         self.start_logger()
 
-    def train_request(self):
+    def train_request(self,client_id):
         # call the train request from alice
-        self.logger.info("Train Request")
-        self.alice.rpc_sync(timeout=0).train()
+        self.logger.info(f"Train Request for Alice{client_id}")
+        if self.last_alice_id is None:
+            self.alices[client_id].rpc_sync(timeout=0).train(None,None)
+        else:
+            self.alices[client_id].rpc_sync(timeout=0).train(self.alices[self.last_alice_id],self.last_alice_id)
+        self.last_alice_id = client_id
 
     def eval_request(self):
-        self.alice.rpc_sync(timeout=0).eval()
+        self.logger.info("Initializing Evaluation of all Alices")
+        total = []
+        num_corr = []
+        check_eval = [self.alices[client_id].rpc_async(timeout=0).eval() for client_id in
+                      range(1, self.client_num_in_total + 1)]
+        for check in check_eval:
+            corr, tot = check.wait()
+            total.append(tot)
+            num_corr.append(corr)
+
+        self.logger.info("Accuracy over all data: {:.3f}".format(sum(num_corr) / sum(total)))
 
     def train(self,x):
         return self.model(x)
